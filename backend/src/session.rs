@@ -3,7 +3,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use russh::keys::{HashAlg, PrivateKeyWithHashAlg, PublicKeyOrCertificate, load_secret_key};
-use russh::{ChannelMsg, Disconnect, client};
+use russh::{ChannelMsg, ChannelWriteHalf, Disconnect, client};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::config::{AuthMethod, HostKeyPolicy, TerminalSize, TmuxSessionConfig};
@@ -110,6 +110,10 @@ impl RemotePty {
             .window_change(size.columns, size.rows, size.pixel_width, size.pixel_height)
             .await
             .context("failed to resize remote PTY")
+    }
+
+    pub fn into_parts(self) -> (russh::ChannelReadHalf, ChannelWriteHalf<client::Msg>) {
+        self.channel.split()
     }
 
     pub async fn run_stdio(mut self) -> Result<u32> {

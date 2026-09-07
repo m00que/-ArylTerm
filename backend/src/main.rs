@@ -4,7 +4,9 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use backend::config::{AuthMethod, HostKeyPolicy, SshTarget, TerminalSize, TmuxSessionConfig};
-use backend::session::SshSession;
+use backend::manager::{SessionEvent, SessionManager};
+use bytes::Bytes;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -15,12 +17,64 @@ async fn main() -> Result<()> {
         .init();
 
     let config = CliConfig::parse(env::args().skip(1))?.into_session_config()?;
-    let ssh = SshSession::connect(&config).await?;
-    let pty = ssh.open_tmux(&config).await?;
-    let exit_status = pty.run_stdio().await?;
-    ssh.close().await?;
+    let exit_status = run_stdio(config).await?;
 
     std::process::exit(exit_status as i32);
+}
+
+async fn run_stdio(config: TmuxSessionConfig) -> Result<u32> {
+    let (manager, mut events) = SessionManager::spawn(config);
+    manager.connect().await?;
+
+    let mut stdin = tokio::io::stdin();
+    let mut stdout = tokio::io::stdout();
+    let mut stdin_buf = [0_u8; 4096];
+    let mut exit_status = 0;
+
+    loop {
+        tokio::select! {
+            read = stdin.read(&mut stdin_buf) => {
+                let read = read.context("failed to read local stdin")?;
+                if read == 0 {
+                    manager.disconnect().await?;
+                    break;
+                }
+
+                manager
+                    .write(Bytes::copy_from_slice(&stdin_buf[..read]))
+                    .await?;
+            }
+            event = events.recv() => {
+                let Some(event) = event else {
+                    break;
+                };
+
+                match event {
+                    SessionEvent::Output(data) => {
+                        stdout.write_all(&data).await.context("failed to write stdout")?;
+                        stdout.flush().await.context("failed to flush stdout")?;
+                    }
+                    SessionEvent::ExitStatus(status) => {
+                        exit_status = status;
+                        break;
+                    }
+                    SessionEvent::StateChanged(state) => {
+                        tracing::info!(?state, "session state changed");
+                    }
+                    SessionEvent::Error(message) => {
+                        tracing::warn!(%message, "session manager reported an error");
+                    }
+                }
+            }
+            signal = tokio::signal::ctrl_c() => {
+                signal.context("failed to listen for Ctrl-C")?;
+                manager.shutdown().await?;
+                break;
+            }
+        }
+    }
+
+    Ok(exit_status)
 }
 
 #[derive(Debug)]
